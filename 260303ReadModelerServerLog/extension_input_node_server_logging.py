@@ -21,9 +21,13 @@ LOG_PATTERN = re.compile(
 # 形式例: "AEQMC0075I: Accepted connection from ..."
 MSG_SPLIT_PATTERN = re.compile(r'^([A-Z0-9]+):\s*(.*)', re.DOTALL)
 
-# AEQMC0007I メッセージからセッション情報を抽出
+# AEQMC0007I メッセージからセッション開始情報を抽出
 # 例: "Session 25692 (dsuser1@::ffff:192.168.0.1.:50480) started"
-SESSION_PATTERN = re.compile(r'Session\s+(\d+)\s+\(([^@]+)@', re.IGNORECASE)
+SESSION_START_PATTERN = re.compile(r'Session\s+(\d+)\s+\(([^@]+)@.*\)\s+started', re.IGNORECASE)
+
+# AEQMC0032I メッセージからセッション終了情報を抽出
+# 例: "Session 25692 ended"
+SESSION_END_PATTERN = re.compile(r'Session\s+(\d+)\s+ended', re.IGNORECASE)
 
 # メッセージからユーザー名を抽出する正規表現
 # 対象パターン例:
@@ -112,25 +116,63 @@ else:
     outputData['millisecond'] = outputData['millisecond'].fillna(-1).astype(int)
     outputData['process_id'] = outputData['process_id'].fillna(-1).astype(int)
 
-    # AEQMC0007I からプロセスIDとユーザー名のマッピングを作成
-    pid_to_user: dict[int, str] = {}
+    # セッションの開始・終了を時系列で追跡
+    # session_timeline: list of (datetime, process_id, event_type, username)
+    # event_type: 'start' or 'end'
+    session_timeline: list[tuple] = []  # type: ignore[type-arg]
+
     for row in outputData.itertuples():
         msg_id = getattr(row, 'message_id', None)
         msg = getattr(row, 'message', None)
-        if msg_id == 'AEQMC0007I' and msg is not None and isinstance(msg, str):
-            sess = SESSION_PATTERN.search(msg)
-            if sess:
-                session_pid = int(sess.group(1))
-                username = sess.group(2)
-                pid_to_user[session_pid] = username
+        dt = getattr(row, 'datetime', None)
 
-    # 同じプロセスIDを持つすべてのレコードにユーザー名を伝播
+        if msg is not None and isinstance(msg, str) and dt is not None and not pd.isna(dt):
+            # セッション開始を検出
+            if msg_id == 'AEQMC0007I':
+                sess_start = SESSION_START_PATTERN.search(msg)
+                if sess_start:
+                    session_pid = int(sess_start.group(1))
+                    username = sess_start.group(2)
+                    session_timeline.append((pd.Timestamp(dt), session_pid, 'start', username))
+
+            # セッション終了を検出
+            elif msg_id == 'AEQMC0032I':
+                sess_end = SESSION_END_PATTERN.search(msg)
+                if sess_end:
+                    session_pid = int(sess_end.group(1))
+                    session_timeline.append((pd.Timestamp(dt), session_pid, 'end', None))
+
+    # タイムラインを時刻順にソート
+    session_timeline.sort(key=lambda x: x[0])
+
+    # 各レコードに対して、その時点で有効なセッションのユーザー名を割り当てる
     def fill_user_name(row: pd.Series) -> str | None:  # type: ignore[type-arg]
         user = row['user_name']
+        # type: ignore を使用してpandasの型チェックを回避
+        if user is not None and not pd.isna(user):  # type: ignore[arg-type]
+            return str(user)
+
         pid = row['process_id']
-        if pd.isna(user) and isinstance(pid, int) and pid in pid_to_user:  # type: ignore[arg-type]
-            return pid_to_user[pid]
-        return user if pd.notna(user) else None  # type: ignore[return-value]
+        dt = row['datetime']
+
+        if not isinstance(pid, int) or dt is None or pd.isna(dt):  # type: ignore[arg-type]
+            return None
+
+        # このレコードの時刻より前のイベントを逆順で探索
+        current_user: str | None = None
+        for event_dt, event_pid, event_type, event_user in reversed(session_timeline):
+            if event_dt > dt:
+                continue  # このイベントはレコードより後なのでスキップ
+
+            if event_pid == pid:
+                if event_type == 'start':
+                    current_user = event_user
+                    break
+                elif event_type == 'end':
+                    # セッション終了後なので、このプロセスIDは無効
+                    break
+
+        return current_user
 
     outputData['user_name'] = outputData.apply(fill_user_name, axis=1)  # type: ignore[arg-type]
 
